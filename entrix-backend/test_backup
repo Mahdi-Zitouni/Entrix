@@ -1,0 +1,727 @@
+import { Test, TestingModule } from '@nestjs/testing';
+import { INestApplication } from '@nestjs/common';
+import { TypeOrmModule } from '@nestjs/typeorm';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { JwtModule } from '@nestjs/jwt';
+import * as request from 'supertest';
+import { AppModule } from '../src/app.module';
+import { AnalyticsModule } from '../src/modules/analytics/analytics.module';
+import { AnalyticsService } from '../src/modules/analytics/analytics.service';
+import { User } from '../src/modules/users/user.entity';
+import { Role } from '../src/modules/users/role.entity';
+import { Group } from '../src/modules/users/group.entity';
+import { Event } from '../src/modules/events/event.entity';
+import { Venue } from '../src/modules/venues/venue.entity';
+import { Ticket } from '../src/modules/ticketing/ticket.entity';
+import { Payment } from '../src/modules/payments/payment.entity';
+import { Order } from '../src/modules/payments/order.entity';
+import { AuthService } from '../src/modules/auth/auth.service';
+import { UsersService } from '../src/modules/users/users.service';
+import { EventsService } from '../src/modules/events/events.service';
+import { VenuesService } from '../src/modules/venues/venue.service';
+import { TicketingService } from '../src/modules/ticketing/ticketing.service';
+import { PaymentsService } from '../src/modules/payments/payment.service';
+import { OrdersService } from '../src/modules/payments/order.service';
+
+describe('Analytics (e2e)', () => {
+  let app: INestApplication;
+  let analyticsService: AnalyticsService;
+  let authService: AuthService;
+  let usersService: UsersService;
+  let eventsService: EventsService;
+  let venuesService: VenuesService;
+  let ticketingService: TicketingService;
+  let paymentsService: PaymentsService;
+  let ordersService: OrdersService;
+  let adminToken: string;
+  let userToken: string;
+  let adminUser: User;
+  let regularUser: User;
+  let testEvent: Event;
+  let testVenue: Venue;
+
+  beforeAll(async () => {
+    const moduleFixture: TestingModule = await Test.createTestingModule({
+      imports: [
+        ConfigModule.forRoot({
+          isGlobal: true,
+          envFilePath: '.env.test',
+        }),
+        TypeOrmModule.forRootAsync({
+          imports: [ConfigModule],
+          useFactory: (configService: ConfigService) => ({
+            type: 'postgres',
+            host: configService.get('DB_HOST', 'localhost'),
+            port: configService.get('DB_PORT', 5432),
+            username: configService.get('DB_USERNAME', 'test'),
+            password: configService.get('DB_PASSWORD', 'test'),
+            database: configService.get('DB_DATABASE', 'entrix_test'),
+            entities: [User, Role, Group, Event, Venue, Ticket, Payment, Order],
+            synchronize: true,
+            logging: false,
+          }),
+          inject: [ConfigService],
+        }),
+        JwtModule.registerAsync({
+          imports: [ConfigModule],
+          useFactory: (configService: ConfigService) => ({
+            secret: configService.get('JWT_SECRET', 'test-secret'),
+            signOptions: { expiresIn: '1h' },
+          }),
+          inject: [ConfigService],
+        }),
+        AnalyticsModule,
+      ],
+      providers: [AuthService, UsersService, EventsService, VenuesService, TicketingService, PaymentsService, OrdersService],
+    }).compile();
+
+    app = moduleFixture.createNestApplication();
+    await app.init();
+
+    analyticsService = moduleFixture.get<AnalyticsService>(AnalyticsService);
+    authService = moduleFixture.get<AuthService>(AuthService);
+    usersService = moduleFixture.get<UsersService>(UsersService);
+    eventsService = moduleFixture.get<EventsService>(EventsService);
+    venuesService = moduleFixture.get<VenuesService>(VenuesService);
+    ticketingService = moduleFixture.get<TicketingService>(TicketingService);
+    paymentsService = moduleFixture.get<PaymentsService>(PaymentsService);
+    ordersService = moduleFixture.get<OrdersService>(OrdersService);
+
+    // Create test users
+    adminUser = await usersService.createUser({
+      email: 'admin@test.com',
+      password: 'admin123',
+      firstName: 'Admin',
+      lastName: 'User',
+      phone: '+1234567890',
+    });
+
+    regularUser = await usersService.createUser({
+      email: 'user@test.com',
+      password: 'user123',
+      firstName: 'Regular',
+      lastName: 'User',
+      phone: '+1234567891',
+    });
+
+    // Create admin role and assign to admin user
+    const adminRole = await usersService.createRole({
+      name: 'admin',
+      description: 'Administrator role',
+      permissions: ['analytics:read', 'analytics:export'],
+    });
+
+    await usersService.assignRoleToUser(adminUser.id, adminRole.id);
+
+    // Create test venue and event
+    testVenue = await venuesService.createVenue({
+      name: 'Test Stadium',
+      description: 'Test venue for analytics',
+      address: '123 Test Street',
+      city: 'Test City',
+      capacity: 1000,
+      status: 'ACTIVE',
+    });
+
+    testEvent = await eventsService.createEvent({
+      title: 'Test Concert',
+      description: 'A test concert event',
+      startDate: new Date(Date.now() + 24 * 60 * 60 * 1000), // Tomorrow
+      endDate: new Date(Date.now() + 24 * 60 * 60 * 1000 + 3 * 60 * 60 * 1000), // 3 hours later
+      venueId: testVenue.id,
+      organizerId: adminUser.id,
+      category: 'CONCERT',
+      status: 'ACTIVE',
+      capacity: 1000,
+      pricing: { basePrice: 50.00, currency: 'USD' },
+    });
+
+    // Generate tokens
+    adminToken = (await authService.login(adminUser)).access_token;
+    userToken = (await authService.login(regularUser)).access_token;
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  beforeEach(async () => {
+    // Clean up database before each test
+    await analyticsService['analyticsRepository']?.clear();
+  });
+
+  describe('/analytics/dashboard', () => {
+    beforeEach(async () => {
+      // Create some test data for analytics
+      await usersService.createUser({
+        email: 'user2@test.com',
+        password: 'user123',
+        firstName: 'Test',
+        lastName: 'User2',
+        phone: '+1234567892',
+      });
+
+      await eventsService.createEvent({
+        title: 'Test Event 2',
+        description: 'Another test event',
+        startDate: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000), // 2 days from now
+        endDate: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000 + 2 * 60 * 60 * 1000), // 2 hours later
+        venueId: testVenue.id,
+        organizerId: adminUser.id,
+        category: 'SPORTS',
+        status: 'ACTIVE',
+        capacity: 500,
+        pricing: { basePrice: 30.00, currency: 'USD' },
+      });
+    });
+
+    it('should get dashboard analytics', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/analytics/dashboard')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+
+      expect(response.body).toHaveProperty('totalUsers');
+      expect(response.body).toHaveProperty('totalEvents');
+      expect(response.body).toHaveProperty('totalVenues');
+      expect(response.body).toHaveProperty('totalRevenue');
+      expect(response.body).toHaveProperty('totalTickets');
+      expect(response.body).toHaveProperty('activeEvents');
+      expect(response.body).toHaveProperty('upcomingEvents');
+      expect(response.body).toHaveProperty('recentActivity');
+    });
+
+    it('should get dashboard analytics for specific time period', async () => {
+      const startDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); // 30 days ago
+      const endDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days from now
+
+      const response = await request(app.getHttpServer())
+        .get('/analytics/dashboard')
+        .query({
+          startDate: startDate.toISOString(),
+          endDate: endDate.toISOString(),
+        })
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+
+      expect(response.body).toHaveProperty('totalUsers');
+      expect(response.body).toHaveProperty('totalEvents');
+      expect(response.body).toHaveProperty('totalRevenue');
+    });
+  });
+
+  describe('/analytics/events', () => {
+    beforeEach(async () => {
+      // Create additional test events
+      await eventsService.createEvent({
+        title: 'Test Event 2',
+        description: 'Another test event',
+        startDate: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000),
+        endDate: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000 + 2 * 60 * 60 * 1000),
+        venueId: testVenue.id,
+        organizerId: adminUser.id,
+        category: 'SPORTS',
+        status: 'ACTIVE',
+        capacity: 500,
+        pricing: { basePrice: 30.00, currency: 'USD' },
+      });
+
+      await eventsService.createEvent({
+        title: 'Test Event 3',
+        description: 'Third test event',
+        startDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 1 week from now
+        endDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000 + 4 * 60 * 60 * 1000),
+        venueId: testVenue.id,
+        organizerId: adminUser.id,
+        category: 'THEATER',
+        status: 'ACTIVE',
+        capacity: 200,
+        pricing: { basePrice: 75.00, currency: 'USD' },
+      });
+    });
+
+    it('should get event analytics', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/analytics/events')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+
+      expect(response.body).toHaveProperty('totalEvents');
+      expect(response.body).toHaveProperty('activeEvents');
+      expect(response.body).toHaveProperty('upcomingEvents');
+      expect(response.body).toHaveProperty('completedEvents');
+      expect(response.body).toHaveProperty('eventsByCategory');
+      expect(response.body).toHaveProperty('eventsByStatus');
+      expect(response.body).toHaveProperty('averageEventDuration');
+      expect(response.body).toHaveProperty('topPerformingEvents');
+    });
+
+    it('should get event analytics for specific category', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/analytics/events?category=CONCERT')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+
+      expect(response.body).toHaveProperty('totalEvents');
+      expect(response.body).toHaveProperty('activeEvents');
+      expect(response.body).toHaveProperty('eventsByCategory');
+    });
+
+    it('should get event analytics for specific time period', async () => {
+      const startDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000); // 1 week ago
+      const endDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days from now
+
+      const response = await request(app.getHttpServer())
+        .get('/analytics/events')
+        .query({
+          startDate: startDate.toISOString(),
+          endDate: endDate.toISOString(),
+        })
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+
+      expect(response.body).toHaveProperty('totalEvents');
+      expect(response.body).toHaveProperty('activeEvents');
+      expect(response.body).toHaveProperty('upcomingEvents');
+    });
+  });
+
+  describe('/analytics/venues', () => {
+    beforeEach(async () => {
+      // Create additional test venues
+      await venuesService.createVenue({
+        name: 'Test Arena',
+        description: 'Another test venue',
+        address: '456 Test Avenue',
+        city: 'Test City',
+        capacity: 2000,
+        status: 'ACTIVE',
+      });
+
+      await venuesService.createVenue({
+        name: 'Test Theater',
+        description: 'Third test venue',
+        address: '789 Test Boulevard',
+        city: 'Test City',
+        capacity: 300,
+        status: 'ACTIVE',
+      });
+    });
+
+    it('should get venue analytics', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/analytics/venues')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+
+      expect(response.body).toHaveProperty('totalVenues');
+      expect(response.body).toHaveProperty('activeVenues');
+      expect(response.body).toHaveProperty('totalCapacity');
+      expect(response.body).toHaveProperty('averageCapacity');
+      expect(response.body).toHaveProperty('venuesByCity');
+      expect(response.body).toHaveProperty('topVenues');
+      expect(response.body).toHaveProperty('venueUtilization');
+    });
+
+    it('should get venue analytics for specific city', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/analytics/venues?city=Test City')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+
+      expect(response.body).toHaveProperty('totalVenues');
+      expect(response.body).toHaveProperty('activeVenues');
+      expect(response.body).toHaveProperty('venuesByCity');
+    });
+  });
+
+  describe('/analytics/users', () => {
+    beforeEach(async () => {
+      // Create additional test users
+      await usersService.createUser({
+        email: 'user2@test.com',
+        password: 'user123',
+        firstName: 'Test',
+        lastName: 'User2',
+        phone: '+1234567892',
+      });
+
+      await usersService.createUser({
+        email: 'user3@test.com',
+        password: 'user123',
+        firstName: 'Test',
+        lastName: 'User3',
+        phone: '+1234567893',
+      });
+    });
+
+    it('should get user analytics', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/analytics/users')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+
+      expect(response.body).toHaveProperty('totalUsers');
+      expect(response.body).toHaveProperty('activeUsers');
+      expect(response.body).toHaveProperty('newUsers');
+      expect(response.body).toHaveProperty('usersByStatus');
+      expect(response.body).toHaveProperty('userGrowth');
+      expect(response.body).toHaveProperty('topUsers');
+      expect(response.body).toHaveProperty('userEngagement');
+    });
+
+    it('should get user analytics for specific time period', async () => {
+      const startDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); // 30 days ago
+      const endDate = new Date();
+
+      const response = await request(app.getHttpServer())
+        .get('/analytics/users')
+        .query({
+          startDate: startDate.toISOString(),
+          endDate: endDate.toISOString(),
+        })
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+
+      expect(response.body).toHaveProperty('totalUsers');
+      expect(response.body).toHaveProperty('newUsers');
+      expect(response.body).toHaveProperty('userGrowth');
+    });
+  });
+
+  describe('/analytics/tickets', () => {
+    beforeEach(async () => {
+      // Create test ticket types and tickets
+      const ticketType1 = await ticketingService['ticketTypeService'].createTicketType({
+        name: 'General Admission',
+        description: 'Standard admission ticket',
+        category: 'GENERAL',
+        price: 50.00,
+        currency: 'USD',
+        validityPeriod: 24,
+        maxQuantity: 500,
+        isActive: true,
+        benefits: ['General seating'],
+        restrictions: ['No refunds'],
+      });
+
+      const ticketType2 = await ticketingService['ticketTypeService'].createTicketType({
+        name: 'VIP Ticket',
+        description: 'VIP access with premium benefits',
+        category: 'VIP',
+        price: 150.00,
+        currency: 'USD',
+        validityPeriod: 24,
+        maxQuantity: 100,
+        isActive: true,
+        benefits: ['Premium seating', 'Exclusive access'],
+        restrictions: ['Non-transferable'],
+      });
+
+      // Create test tickets
+      await ticketingService.createTicket({
+        eventId: testEvent.id,
+        ticketTypeId: ticketType1.id,
+        userId: regularUser.id,
+        quantity: 1,
+        status: 'ACTIVE',
+        purchaseDate: new Date(),
+        validFrom: new Date(),
+        validUntil: new Date(Date.now() + 24 * 60 * 60 * 1000),
+        metadata: {
+          purchaseMethod: 'online',
+          paymentMethod: 'credit_card',
+        },
+      });
+
+      await ticketingService.createTicket({
+        eventId: testEvent.id,
+        ticketTypeId: ticketType2.id,
+        userId: regularUser.id,
+        quantity: 1,
+        status: 'ACTIVE',
+        purchaseDate: new Date(),
+        validFrom: new Date(),
+        validUntil: new Date(Date.now() + 24 * 60 * 60 * 1000),
+        metadata: {
+          purchaseMethod: 'online',
+          paymentMethod: 'credit_card',
+        },
+      });
+    });
+
+    it('should get ticket analytics', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/analytics/tickets')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+
+      expect(response.body).toHaveProperty('totalTickets');
+      expect(response.body).toHaveProperty('soldTickets');
+      expect(response.body).toHaveProperty('availableTickets');
+      expect(response.body).toHaveProperty('usedTickets');
+      expect(response.body).toHaveProperty('ticketsByStatus');
+      expect(response.body).toHaveProperty('ticketsByType');
+      expect(response.body).toHaveProperty('averageTicketPrice');
+      expect(response.body).toHaveProperty('ticketSalesTrend');
+    });
+
+    it('should get ticket analytics for specific event', async () => {
+      const response = await request(app.getHttpServer())
+        .get(`/analytics/tickets?eventId=${testEvent.id}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+
+      expect(response.body).toHaveProperty('totalTickets');
+      expect(response.body).toHaveProperty('soldTickets');
+      expect(response.body).toHaveProperty('ticketsByStatus');
+    });
+  });
+
+  describe('/analytics/revenue', () => {
+    beforeEach(async () => {
+      // Create test orders and payments
+      const order1 = await ordersService.createOrder({
+        userId: regularUser.id,
+        eventId: testEvent.id,
+        status: 'COMPLETED',
+        totalAmount: 50.00,
+        currency: 'USD',
+        billingAddress: {
+          street: '123 Test Street',
+          city: 'Test City',
+          state: 'Test State',
+          country: 'Test Country',
+          postalCode: '12345',
+        },
+        shippingAddress: {
+          street: '123 Test Street',
+          city: 'Test City',
+          state: 'Test State',
+          country: 'Test Country',
+          postalCode: '12345',
+        },
+        metadata: {
+          source: 'web',
+          userAgent: 'test-agent',
+        },
+      });
+
+      const order2 = await ordersService.createOrder({
+        userId: regularUser.id,
+        eventId: testEvent.id,
+        status: 'COMPLETED',
+        totalAmount: 150.00,
+        currency: 'USD',
+        billingAddress: {
+          street: '123 Test Street',
+          city: 'Test City',
+          state: 'Test State',
+          country: 'Test Country',
+          postalCode: '12345',
+        },
+        shippingAddress: {
+          street: '123 Test Street',
+          city: 'Test City',
+          state: 'Test State',
+          country: 'Test Country',
+          postalCode: '12345',
+        },
+        metadata: {
+          source: 'web',
+          userAgent: 'test-agent',
+        },
+      });
+
+      // Create test payments
+      await paymentsService.processPayment({
+        orderId: order1.id,
+        paymentMethodId: 'test_method_1',
+        amount: 50.00,
+        currency: 'USD',
+        status: 'COMPLETED',
+        metadata: {
+          gateway: 'stripe',
+          transactionId: 'txn_test_1',
+        },
+      });
+
+      await paymentsService.processPayment({
+        orderId: order2.id,
+        paymentMethodId: 'test_method_2',
+        amount: 150.00,
+        currency: 'USD',
+        status: 'COMPLETED',
+        metadata: {
+          gateway: 'stripe',
+          transactionId: 'txn_test_2',
+        },
+      });
+    });
+
+    it('should get revenue analytics', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/analytics/revenue')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+
+      expect(response.body).toHaveProperty('totalRevenue');
+      expect(response.body).toHaveProperty('revenueByPeriod');
+      expect(response.body).toHaveProperty('revenueByEvent');
+      expect(response.body).toHaveProperty('revenueByVenue');
+      expect(response.body).toHaveProperty('averageOrderValue');
+      expect(response.body).toHaveProperty('revenueGrowth');
+      expect(response.body).toHaveProperty('topRevenueEvents');
+    });
+
+    it('should get revenue analytics for specific time period', async () => {
+      const startDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); // 30 days ago
+      const endDate = new Date();
+
+      const response = await request(app.getHttpServer())
+        .get('/analytics/revenue')
+        .query({
+          startDate: startDate.toISOString(),
+          endDate: endDate.toISOString(),
+        })
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+
+      expect(response.body).toHaveProperty('totalRevenue');
+      expect(response.body).toHaveProperty('revenueByPeriod');
+      expect(response.body).toHaveProperty('revenueGrowth');
+    });
+  });
+
+  describe('/analytics/reports', () => {
+    it('should generate event report', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/analytics/reports')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          type: 'event',
+          format: 'pdf',
+          filters: {
+            startDate: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
+            endDate: new Date().toISOString(),
+            category: 'CONCERT',
+          },
+        })
+        .expect(201);
+
+      expect(response.body).toHaveProperty('id');
+      expect(response.body).toHaveProperty('type');
+      expect(response.body).toHaveProperty('format');
+      expect(response.body).toHaveProperty('status');
+    });
+
+    it('should generate revenue report', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/analytics/reports')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          type: 'revenue',
+          format: 'excel',
+          filters: {
+            startDate: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
+            endDate: new Date().toISOString(),
+          },
+        })
+        .expect(201);
+
+      expect(response.body).toHaveProperty('id');
+      expect(response.body).toHaveProperty('type');
+      expect(response.body).toHaveProperty('format');
+      expect(response.body).toHaveProperty('status');
+    });
+  });
+
+  describe('/analytics/reports/:id (GET)', () => {
+    it('should get report status', async () => {
+      // First create a report
+      const createResponse = await request(app.getHttpServer())
+        .post('/analytics/reports')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          type: 'event',
+          format: 'pdf',
+          filters: {
+            startDate: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
+            endDate: new Date().toISOString(),
+          },
+        })
+        .expect(201);
+
+      const reportId = createResponse.body.id;
+
+      // Then check its status
+      const response = await request(app.getHttpServer())
+        .get(`/analytics/reports/${reportId}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+
+      expect(response.body).toHaveProperty('id');
+      expect(response.body).toHaveProperty('type');
+      expect(response.body).toHaveProperty('format');
+      expect(response.body).toHaveProperty('status');
+    });
+  });
+
+  describe('/analytics/export', () => {
+    it('should export analytics data to CSV', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/analytics/export')
+        .query({
+          type: 'events',
+          format: 'csv',
+          startDate: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
+          endDate: new Date().toISOString(),
+        })
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+
+      expect(response.headers['content-type']).toContain('text/csv');
+      expect(response.headers['content-disposition']).toContain('attachment');
+    });
+
+    it('should export analytics data to Excel', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/analytics/export')
+        .query({
+          type: 'revenue',
+          format: 'excel',
+          startDate: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
+          endDate: new Date().toISOString(),
+        })
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+
+      expect(response.headers['content-type']).toContain('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      expect(response.headers['content-disposition']).toContain('attachment');
+    });
+  });
+
+  describe('/analytics/insights', () => {
+    it('should get business insights', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/analytics/insights')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+
+      expect(response.body).toHaveProperty('topInsights');
+      expect(response.body).toHaveProperty('recommendations');
+      expect(response.body).toHaveProperty('trends');
+      expect(response.body).toHaveProperty('anomalies');
+    });
+
+    it('should get insights for specific area', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/analytics/insights?area=events')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+
+      expect(response.body).toHaveProperty('topInsights');
+      expect(response.body).toHaveProperty('recommendations');
+    });
+  });
+}); 
